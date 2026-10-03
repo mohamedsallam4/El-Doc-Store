@@ -1,7 +1,9 @@
+import 'dart:convert';
 import 'package:flutter/material.dart';
 import 'package:image_picker/image_picker.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 import 'package:google_fonts/google_fonts.dart';
+import 'package:url_launcher/url_launcher.dart';
 
 class AdminDashboard extends StatefulWidget {
   const AdminDashboard({super.key});
@@ -16,14 +18,26 @@ class _AdminDashboardState extends State<AdminDashboard> with SingleTickerProvid
   bool _isAuthenticated = false;
   final TextEditingController _adminEmailCtrl = TextEditingController();
   final TextEditingController _adminPassCtrl = TextEditingController();
+  bool _obscurePassword = true;
   String? _authError;
 
   int _selectedTabIndex = 0;
   bool _isLoading = false;
   List<Map<String, dynamic>> _products = [];
   List<Map<String, dynamic>> _orders = [];
+  List<Map<String, dynamic>> _promoCodes = [];
   String _searchQuery = '';
+  String _categoryFilter = 'ALL';
   RealtimeChannel? _ordersSubscription;
+
+  String _orderSearchQuery = '';
+  String _orderStatusFilter = 'ALL';
+
+  Map<String, dynamic> _storeSettings = {
+    'whatsapp_url': 'https://wa.me/201000000000',
+    'facebook_url': 'https://facebook.com',
+    'instagram_url': 'https://instagram.com',
+  };
 
   @override
   void initState() {
@@ -37,6 +51,8 @@ class _AdminDashboardState extends State<AdminDashboard> with SingleTickerProvid
   @override
   void dispose() {
     _ordersSubscription?.unsubscribe();
+    _adminEmailCtrl.dispose();
+    _adminPassCtrl.dispose();
     super.dispose();
   }
 
@@ -90,7 +106,7 @@ class _AdminDashboardState extends State<AdminDashboard> with SingleTickerProvid
         _loadDashboardData();
       }
     } catch (e) {
-      if (_adminEmailCtrl.text == 'admin@eldoc.com' && _adminPassCtrl.text == 'admin123') {
+      if (_adminEmailCtrl.text.trim() == 'admin@eldoc.com' && _adminPassCtrl.text.trim() == 'admin123') {
         setState(() {
           _isAuthenticated = true;
           _isLoading = false;
@@ -98,7 +114,7 @@ class _AdminDashboardState extends State<AdminDashboard> with SingleTickerProvid
         _loadDashboardData();
       } else {
         setState(() {
-          _authError = 'Authentication failed. Please check your credentials.';
+          _authError = 'Invalid credentials. Please verify your email and password.';
           _isLoading = false;
         });
       }
@@ -107,9 +123,27 @@ class _AdminDashboardState extends State<AdminDashboard> with SingleTickerProvid
 
   Future<void> _loadDashboardData() async {
     setState(() => _isLoading = true);
-    await Future.wait([_fetchProducts(), _fetchOrders()]);
+    await Future.wait([
+      _fetchProducts(),
+      _fetchOrders(),
+      _fetchStoreSettings(),
+      _fetchPromoCodes(),
+    ]);
     _setupRealtimeOrders();
     setState(() => _isLoading = false);
+  }
+
+  Future<void> _fetchStoreSettings() async {
+    try {
+      final data = await _supabase.from('store_settings').select().eq('id', 'default').maybeSingle();
+      if (data != null) {
+        setState(() {
+          _storeSettings = Map<String, dynamic>.from(data);
+        });
+      }
+    } catch (e) {
+      debugPrint('Error fetching store settings: $e');
+    }
   }
 
   Future<void> _fetchProducts() async {
@@ -138,6 +172,16 @@ class _AdminDashboardState extends State<AdminDashboard> with SingleTickerProvid
     }
   }
 
+  Future<void> _fetchPromoCodes() async {
+    try {
+      final res = await _supabase.from('promo_codes').select().order('created_at', ascending: false);
+      _promoCodes = List<Map<String, dynamic>>.from(res);
+      if (mounted) setState(() {});
+    } catch (e) {
+      debugPrint('Error fetching promo codes: $e');
+    }
+  }
+
   Future<void> _deleteProduct(String id) async {
     final isDark = Theme.of(context).brightness == Brightness.dark;
     final confirm = await showDialog<bool>(
@@ -162,9 +206,229 @@ class _AdminDashboardState extends State<AdminDashboard> with SingleTickerProvid
     );
 
     if (confirm == true) {
-      await _supabase.from('products').delete().match({'id': id});
-      _fetchProducts();
+      try {
+        await _supabase.from('products').delete().match({'id': id});
+        _fetchProducts();
+      } catch (e) {
+        debugPrint('Error deleting product: $e');
+      }
     }
+  }
+
+  Future<void> _exportOrdersToCsv() async {
+    if (_orders.isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('No orders to export', style: GoogleFonts.montserrat())));
+      return;
+    }
+
+    final StringBuffer buffer = StringBuffer();
+    buffer.writeln('Order ID,Date,Customer Name,Phone,Address,Total Amount,Status,Payment Method');
+
+    for (var ord in _orders) {
+      final id = _safeId(ord['id']);
+      final date = ord['created_at'] != null ? ord['created_at'].toString().substring(0, 10) : '-';
+      final name = '"${(ord['customer_name'] ?? '').toString().replaceAll('"', '""')}"';
+      final phone = '"${(ord['customer_phone'] ?? '').toString().replaceAll('"', '""')}"';
+      final address = '"${(ord['shipping_address'] ?? '').toString().replaceAll('"', '""')}"';
+      final amount = ord['total_amount'] ?? 0.0;
+      final status = ord['status'] ?? 'pending';
+      final method = ord['payment_method'] ?? 'cash_on_delivery';
+
+      buffer.writeln('$id,$date,$name,$phone,$address,$amount,$status,$method');
+    }
+
+    final bytes = utf8.encode(buffer.toString());
+    final base64String = base64Encode(bytes);
+    final url = 'data:text/csv;charset=utf-8;base64,$base64String';
+
+    try {
+      await launchUrl(Uri.parse(url), mode: LaunchMode.externalApplication);
+    } catch (e) {
+      debugPrint('Error downloading CSV: $e');
+    }
+  }
+
+  void _openAddPromoModal() {
+    final codeCtrl = TextEditingController();
+    final discountCtrl = TextEditingController();
+    final maxUsesCtrl = TextEditingController(text: '100');
+    final isDark = Theme.of(context).brightness == Brightness.dark;
+
+    showDialog(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        backgroundColor: isDark ? const Color(0xFF141414) : Colors.white,
+        shape: const RoundedRectangleBorder(borderRadius: BorderRadius.zero),
+        title: Text('NEW PROMO CODE', style: GoogleFonts.montserrat(fontWeight: FontWeight.w900, fontSize: 16, color: isDark ? Colors.white : Colors.black)),
+        content: SizedBox(
+          width: 400,
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              _buildOutlinedTextField(label: 'Promo Code (e.g. SUMMER15)', controller: codeCtrl, isDark: isDark),
+              const SizedBox(height: 12),
+              _buildOutlinedTextField(label: 'Discount Percentage (%) (e.g. 15)', controller: discountCtrl, isNumber: true, isDark: isDark),
+              const SizedBox(height: 12),
+              _buildOutlinedTextField(label: 'Maximum Usages (Limit)', controller: maxUsesCtrl, isNumber: true, isDark: isDark),
+            ],
+          ),
+        ),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx), child: Text('CANCEL', style: GoogleFonts.montserrat(color: Colors.grey, fontWeight: FontWeight.bold))),
+          ElevatedButton(
+            style: ElevatedButton.styleFrom(backgroundColor: isDark ? Colors.white : Colors.black, foregroundColor: isDark ? Colors.black : Colors.white, shape: const RoundedRectangleBorder(borderRadius: BorderRadius.zero)),
+            onPressed: () async {
+              if (codeCtrl.text.isEmpty || discountCtrl.text.isEmpty) return;
+              await _supabase.from('promo_codes').insert({
+                'code': codeCtrl.text.trim().toUpperCase(),
+                'discount_percentage': double.tryParse(discountCtrl.text) ?? 10.0,
+                'max_uses': int.tryParse(maxUsesCtrl.text) ?? 100,
+                'is_active': true,
+              });
+              Navigator.pop(ctx);
+              _fetchPromoCodes();
+            },
+            child: Text('CREATE CODE', style: GoogleFonts.montserrat(fontWeight: FontWeight.bold)),
+          ),
+        ],
+      ),
+    );
+  }
+
+  void _openSettingsModal() {
+    final isDark = Theme.of(context).brightness == Brightness.dark;
+    final waCtrl = TextEditingController(text: _storeSettings['whatsapp_url'] ?? '');
+    final fbCtrl = TextEditingController(text: _storeSettings['facebook_url'] ?? '');
+    final instaCtrl = TextEditingController(text: _storeSettings['instagram_url'] ?? '');
+
+    final newPassCtrl = TextEditingController();
+    final confirmPassCtrl = TextEditingController();
+    String? statusMessage;
+    bool isSaving = false;
+
+    showDialog(
+      context: context,
+      builder: (ctx) => StatefulBuilder(
+        builder: (context, setModalState) => Dialog(
+          backgroundColor: isDark ? const Color(0xFF141414) : Colors.white,
+          shape: const RoundedRectangleBorder(borderRadius: BorderRadius.zero),
+          insetPadding: const EdgeInsets.symmetric(horizontal: 24, vertical: 24),
+          child: Container(
+            width: 650,
+            padding: const EdgeInsets.all(40),
+            child: SingleChildScrollView(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Row(
+                    mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                    children: [
+                      Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Text('PROFILE & STORE SETTINGS', style: GoogleFonts.montserrat(fontWeight: FontWeight.w900, fontSize: 18, letterSpacing: 1.5, color: isDark ? Colors.white : Colors.black)),
+                          const SizedBox(height: 4),
+                          Text('Control your store social links and administrator password', style: GoogleFonts.montserrat(fontSize: 11, color: isDark ? Colors.white54 : Colors.black54)),
+                        ],
+                      ),
+                      IconButton(icon: Icon(Icons.close, color: isDark ? Colors.white54 : Colors.black54), onPressed: () => Navigator.pop(ctx)),
+                    ],
+                  ),
+                  Divider(height: 32, color: isDark ? const Color(0xFF262626) : const Color(0xFFE5E7EB)),
+
+                  Text('SOCIAL MEDIA & CONTACT LINKS', style: GoogleFonts.montserrat(fontWeight: FontWeight.w900, fontSize: 12, letterSpacing: 1.5, color: isDark ? Colors.white70 : Colors.black87)),
+                  const SizedBox(height: 16),
+                  _buildOutlinedTextField(label: 'WhatsApp Link (e.g. https://wa.me/201...)', controller: waCtrl, isDark: isDark),
+                  const SizedBox(height: 12),
+                  _buildOutlinedTextField(label: 'Facebook Page URL', controller: fbCtrl, isDark: isDark),
+                  const SizedBox(height: 12),
+                  _buildOutlinedTextField(label: 'Instagram Profile URL', controller: instaCtrl, isDark: isDark),
+
+                  const SizedBox(height: 36),
+                  Divider(height: 1, color: isDark ? const Color(0xFF262626) : const Color(0xFFE5E7EB)),
+                  const SizedBox(height: 24),
+
+                  Text('SECURITY & PASSWORD MANAGEMENT', style: GoogleFonts.montserrat(fontWeight: FontWeight.w900, fontSize: 12, letterSpacing: 1.5, color: isDark ? Colors.white70 : Colors.black87)),
+                  const SizedBox(height: 16),
+                  _buildOutlinedTextField(label: 'New Password', controller: newPassCtrl, isDark: isDark),
+                  const SizedBox(height: 12),
+                  _buildOutlinedTextField(label: 'Confirm New Password', controller: confirmPassCtrl, isDark: isDark),
+
+                  if (statusMessage != null) ...[
+                    const SizedBox(height: 16),
+                    Text(statusMessage!, style: GoogleFonts.montserrat(fontSize: 12, fontWeight: FontWeight.bold, color: statusMessage!.contains('Success') ? Colors.green : Colors.redAccent)),
+                  ],
+
+                  const SizedBox(height: 36),
+                  SizedBox(
+                    width: double.infinity,
+                    height: 52,
+                    child: ElevatedButton(
+                      style: ElevatedButton.styleFrom(
+                        backgroundColor: isDark ? Colors.white : Colors.black,
+                        foregroundColor: isDark ? Colors.black : Colors.white,
+                        shape: const RoundedRectangleBorder(borderRadius: BorderRadius.zero),
+                      ),
+                      onPressed: isSaving ? null : () async {
+                        setModalState(() => isSaving = true);
+
+                        try {
+                          await _supabase.from('store_settings').upsert({
+                            'id': 'default',
+                            'whatsapp_url': waCtrl.text.trim(),
+                            'facebook_url': fbCtrl.text.trim(),
+                            'instagram_url': instaCtrl.text.trim(),
+                            'updated_at': DateTime.now().toIso8601String(),
+                          });
+
+                          if (newPassCtrl.text.isNotEmpty) {
+                            if (newPassCtrl.text.length < 6) {
+                              setModalState(() {
+                                statusMessage = 'Password must be at least 6 characters.';
+                                isSaving = false;
+                              });
+                              return;
+                            }
+                            if (newPassCtrl.text != confirmPassCtrl.text) {
+                              setModalState(() {
+                                statusMessage = 'Passwords do not match.';
+                                isSaving = false;
+                              });
+                              return;
+                            }
+                            await _supabase.auth.updateUser(UserAttributes(password: newPassCtrl.text.trim()));
+                          }
+
+                          await _fetchStoreSettings();
+
+                          setModalState(() {
+                            statusMessage = 'Successfully updated settings!';
+                            isSaving = false;
+                          });
+
+                          Future.delayed(const Duration(seconds: 1), () {
+                            if (mounted) Navigator.pop(ctx);
+                          });
+                        } catch (e) {
+                          setModalState(() {
+                            statusMessage = 'Error saving settings: $e';
+                            isSaving = false;
+                          });
+                        }
+                      },
+                      child: isSaving
+                          ? const SizedBox(width: 20, height: 20, child: CircularProgressIndicator(strokeWidth: 2))
+                          : Text('SAVE CHANGES', style: GoogleFonts.montserrat(fontWeight: FontWeight.bold, letterSpacing: 1.5, fontSize: 13)),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
   }
 
   void _openProductDialog({Map<String, dynamic>? existingProduct}) {
@@ -583,83 +847,223 @@ class _AdminDashboardState extends State<AdminDashboard> with SingleTickerProvid
   }
 
   Widget _buildAdminLoginView() {
+    final screenWidth = MediaQuery.of(context).size.width;
+    final isDesktop = screenWidth >= 950;
+
     return Scaffold(
-      backgroundColor: const Color(0xFF111827),
-      body: Center(
-        child: Container(
-          width: 440,
-          padding: const EdgeInsets.symmetric(horizontal: 48, vertical: 56),
-          decoration: const BoxDecoration(
-            color: Colors.white,
-            borderRadius: BorderRadius.zero,
-            boxShadow: [BoxShadow(color: Colors.black45, blurRadius: 40, offset: Offset(0, 20))],
-          ),
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              Text('EL DOC', style: GoogleFonts.montserrat(fontSize: 32, fontWeight: FontWeight.w900, letterSpacing: 4, color: Colors.black87)),
-              const SizedBox(height: 6),
-              Text('PORTAL ACCESS CONTROL', style: GoogleFonts.montserrat(fontSize: 10, letterSpacing: 2.5, color: Colors.black45, fontWeight: FontWeight.bold)),
-              const SizedBox(height: 48),
-              
-              Text('Restricted Area', style: GoogleFonts.montserrat(fontSize: 17, fontWeight: FontWeight.bold, color: Colors.black87)),
-              const SizedBox(height: 8),
-              Text('Please identify yourself with admin privileges.', style: GoogleFonts.montserrat(color: Colors.black54, fontSize: 13, fontWeight: FontWeight.w500)),
-              const SizedBox(height: 40),
-
-              _buildPremiumLoginTextField(label: 'Admin Email', controller: _adminEmailCtrl),
-              const SizedBox(height: 28),
-              _buildPremiumLoginTextField(label: 'Security Key / Password', controller: _adminPassCtrl, obscure: true),
-
-              if (_authError != null) ...[
-                const SizedBox(height: 20),
-                Row(
-                  children: [
-                    const Icon(Icons.error_outline, color: Colors.red, size: 18),
-                    const SizedBox(width: 8),
-                    Expanded(child: Text(_authError!, style: GoogleFonts.montserrat(color: Colors.red, fontSize: 13, fontWeight: FontWeight.bold))),
-                  ],
-                ),
-              ],
-              const SizedBox(height: 48),
-
-              SizedBox(
-                width: double.infinity,
-                height: 56,
-                child: ElevatedButton(
-                  style: ElevatedButton.styleFrom(
-                    backgroundColor: Colors.black,
-                    foregroundColor: Colors.white,
-                    elevation: 0,
-                    shape: const RoundedRectangleBorder(borderRadius: BorderRadius.zero),
+      backgroundColor: const Color(0xFF0A0A0A),
+      body: Row(
+        children: [
+          if (isDesktop)
+            Expanded(
+              flex: 6,
+              child: Stack(
+                fit: StackFit.expand,
+                children: [
+                  Image.network(
+                    'https://images.unsplash.com/photo-1552346154-21d32810aba3?w=1600&auto=format&fit=crop&q=80',
+                    fit: BoxFit.cover,
                   ),
-                  onPressed: _isLoading ? null : _loginAdmin,
-                  child: _isLoading
-                      ? const SizedBox(width: 24, height: 24, child: CircularProgressIndicator(color: Colors.white, strokeWidth: 2))
-                      : Text('AUTHENTICATE', style: GoogleFonts.montserrat(fontWeight: FontWeight.bold, letterSpacing: 2, fontSize: 14)),
+                  Container(
+                    decoration: BoxDecoration(
+                      gradient: LinearGradient(
+                        begin: Alignment.topRight,
+                        end: Alignment.bottomLeft,
+                        colors: [
+                          Colors.black.withOpacity(0.3),
+                          Colors.black.withOpacity(0.85),
+                          const Color(0xFF0A0A0A),
+                        ],
+                      ),
+                    ),
+                  ),
+                  Padding(
+                    padding: const EdgeInsets.all(64),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Row(
+                          children: [
+                            Container(
+                              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+                              decoration: BoxDecoration(
+                                border: Border.all(color: Colors.white24),
+                                color: Colors.black.withOpacity(0.5),
+                              ),
+                              child: Text(
+                                'CONTROL SUITE // ATELIER',
+                                style: GoogleFonts.montserrat(fontSize: 10, letterSpacing: 2, fontWeight: FontWeight.w700, color: Colors.white70),
+                              ),
+                            ),
+                            const SizedBox(width: 12),
+                            const Icon(Icons.lock_outline, size: 14, color: Colors.white38),
+                            const SizedBox(width: 4),
+                            Text(
+                              '256-BIT ENCRYPTION',
+                              style: GoogleFonts.montserrat(fontSize: 9, letterSpacing: 1.5, color: Colors.white38, fontWeight: FontWeight.bold),
+                            ),
+                          ],
+                        ),
+                        const Spacer(),
+                        Text(
+                          'EL DOC',
+                          style: GoogleFonts.montserrat(
+                            fontSize: 56,
+                            fontWeight: FontWeight.w900,
+                            letterSpacing: 6,
+                            color: Colors.white,
+                            height: 1.0,
+                          ),
+                        ),
+                        const SizedBox(height: 12),
+                        Text(
+                          'EXECUTIVE ADMINISTRATION ATELIER',
+                          style: GoogleFonts.montserrat(
+                            fontSize: 12,
+                            letterSpacing: 3,
+                            fontWeight: FontWeight.w700,
+                            color: Colors.white60,
+                          ),
+                        ),
+                        const SizedBox(height: 24),
+                        ConstrainedBox(
+                          constraints: const BoxConstraints(maxWidth: 480),
+                          child: Text(
+                            'Authorized personnel gateway for luxury inventory management, live client dispatch tracking, and financial analytics.',
+                            style: GoogleFonts.montserrat(
+                              fontSize: 14,
+                              height: 1.7,
+                              fontWeight: FontWeight.w400,
+                              color: Colors.white38,
+                            ),
+                          ),
+                        ),
+                        const SizedBox(height: 32),
+                      ],
+                    ),
+                  ),
+                ],
+              ),
+            ),
+
+          Expanded(
+            flex: isDesktop ? 5 : 1,
+            child: Container(
+              color: const Color(0xFF0F0F0F),
+              padding: EdgeInsets.symmetric(horizontal: isDesktop ? 64 : 24, vertical: 48),
+              child: Center(
+                child: ConstrainedBox(
+                  constraints: const BoxConstraints(maxWidth: 420),
+                  child: Column(
+                    mainAxisAlignment: MainAxisAlignment.center,
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Align(
+                        alignment: Alignment.centerLeft,
+                        child: TextButton.icon(
+                          style: TextButton.styleFrom(foregroundColor: Colors.white54, padding: EdgeInsets.zero),
+                          onPressed: () => Navigator.pop(context),
+                          icon: const Icon(Icons.arrow_back, size: 16),
+                          label: Text('RETURN TO STOREFRONT', style: GoogleFonts.montserrat(fontSize: 11, fontWeight: FontWeight.bold, letterSpacing: 1.5)),
+                        ),
+                      ),
+                      const SizedBox(height: 48),
+
+                      Text('PORTAL LOGIN', style: GoogleFonts.montserrat(fontSize: 28, fontWeight: FontWeight.w900, letterSpacing: 2, color: Colors.white)),
+                      const SizedBox(height: 8),
+                      Text('Identify yourself with verified administrative credentials.', style: GoogleFonts.montserrat(fontSize: 13, color: Colors.white38, fontWeight: FontWeight.w500)),
+                      const SizedBox(height: 40),
+
+                      Text('ADMIN EMAIL', style: GoogleFonts.montserrat(fontSize: 11, fontWeight: FontWeight.bold, letterSpacing: 1.5, color: Colors.white70)),
+                      const SizedBox(height: 10),
+                      TextField(
+                        controller: _adminEmailCtrl,
+                        style: GoogleFonts.montserrat(fontSize: 14, fontWeight: FontWeight.w600, color: Colors.white),
+                        decoration: InputDecoration(
+                          hintText: 'admin@eldoc.com',
+                          hintStyle: GoogleFonts.montserrat(color: Colors.white24, fontSize: 13),
+                          prefixIcon: const Icon(Icons.alternate_email, size: 18, color: Colors.white38),
+                          filled: true,
+                          fillColor: const Color(0xFF181818),
+                          contentPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 18),
+                          border: OutlineInputBorder(borderRadius: BorderRadius.zero, borderSide: BorderSide(color: Colors.white.withOpacity(0.08))),
+                          enabledBorder: OutlineInputBorder(borderRadius: BorderRadius.zero, borderSide: BorderSide(color: Colors.white.withOpacity(0.08))),
+                          focusedBorder: const OutlineInputBorder(borderRadius: BorderRadius.zero, borderSide: BorderSide(color: Colors.white, width: 1.5)),
+                        ),
+                      ),
+                      const SizedBox(height: 24),
+
+                      Text('SECURITY KEY', style: GoogleFonts.montserrat(fontSize: 11, fontWeight: FontWeight.bold, letterSpacing: 1.5, color: Colors.white70)),
+                      const SizedBox(height: 10),
+                      TextField(
+                        controller: _adminPassCtrl,
+                        obscureText: _obscurePassword,
+                        style: GoogleFonts.montserrat(fontSize: 14, fontWeight: FontWeight.w600, color: Colors.white),
+                        decoration: InputDecoration(
+                          hintText: '••••••••••••',
+                          hintStyle: GoogleFonts.montserrat(color: Colors.white24, fontSize: 13),
+                          prefixIcon: const Icon(Icons.lock_outline, size: 18, color: Colors.white38),
+                          suffixIcon: IconButton(
+                            icon: Icon(_obscurePassword ? Icons.visibility_off_outlined : Icons.visibility_outlined, size: 18, color: Colors.white38),
+                            onPressed: () => setState(() => _obscurePassword = !_obscurePassword),
+                          ),
+                          filled: true,
+                          fillColor: const Color(0xFF181818),
+                          contentPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 18),
+                          border: OutlineInputBorder(borderRadius: BorderRadius.zero, borderSide: BorderSide(color: Colors.white.withOpacity(0.08))),
+                          enabledBorder: OutlineInputBorder(borderRadius: BorderRadius.zero, borderSide: BorderSide(color: Colors.white.withOpacity(0.08))),
+                          focusedBorder: const OutlineInputBorder(borderRadius: BorderRadius.zero, borderSide: BorderSide(color: Colors.white, width: 1.5)),
+                        ),
+                      ),
+
+                      if (_authError != null) ...[
+                        const SizedBox(height: 20),
+                        Container(
+                          padding: const EdgeInsets.all(12),
+                          decoration: BoxDecoration(color: Colors.red.withOpacity(0.1), border: Border.all(color: Colors.red.withOpacity(0.3))),
+                          child: Row(
+                            children: [
+                              const Icon(Icons.error_outline, color: Colors.redAccent, size: 18),
+                              const SizedBox(width: 10),
+                              Expanded(child: Text(_authError!, style: GoogleFonts.montserrat(color: Colors.redAccent, fontSize: 12, fontWeight: FontWeight.w600))),
+                            ],
+                          ),
+                        ),
+                      ],
+
+                      const SizedBox(height: 36),
+
+                      SizedBox(
+                        width: double.infinity,
+                        height: 56,
+                        child: ElevatedButton(
+                          style: ElevatedButton.styleFrom(
+                            backgroundColor: Colors.white,
+                            foregroundColor: Colors.black,
+                            elevation: 0,
+                            shape: const RoundedRectangleBorder(borderRadius: BorderRadius.zero),
+                          ),
+                          onPressed: _isLoading ? null : _loginAdmin,
+                          child: _isLoading
+                              ? const SizedBox(width: 22, height: 22, child: CircularProgressIndicator(color: Colors.black, strokeWidth: 2))
+                              : Text('AUTHENTICATE', style: GoogleFonts.montserrat(fontWeight: FontWeight.w900, letterSpacing: 2, fontSize: 13)),
+                        ),
+                      ),
+
+                      const SizedBox(height: 24),
+                      Center(
+                        child: Text(
+                          'DEFAULT ACCESS: admin@eldoc.com // admin123',
+                          style: GoogleFonts.montserrat(fontSize: 10, letterSpacing: 1.5, color: Colors.white24, fontWeight: FontWeight.bold),
+                        ),
+                      ),
+                    ],
+                  ),
                 ),
               ),
-            ],
+            ),
           ),
-        ),
-      ),
-    );
-  }
-
-  Widget _buildPremiumLoginTextField({required String label, required TextEditingController controller, bool obscure = false}) {
-    return TextField(
-      controller: controller,
-      obscureText: obscure,
-      style: GoogleFonts.montserrat(fontSize: 14, fontWeight: FontWeight.w600, color: Colors.black87),
-      decoration: InputDecoration(
-        labelText: label,
-        labelStyle: GoogleFonts.montserrat(color: Colors.black45, fontSize: 13, fontWeight: FontWeight.w600),
-        floatingLabelBehavior: FloatingLabelBehavior.always,
-        contentPadding: const EdgeInsets.symmetric(horizontal: 20, vertical: 20),
-        border: const OutlineInputBorder(borderRadius: BorderRadius.zero, borderSide: BorderSide(color: Colors.black87)),
-        enabledBorder: const OutlineInputBorder(borderRadius: BorderRadius.zero, borderSide: BorderSide(color: Colors.black26)),
-        focusedBorder: const OutlineInputBorder(borderRadius: BorderRadius.zero, borderSide: BorderSide(color: Colors.black, width: 2)),
+        ],
       ),
     );
   }
@@ -686,7 +1090,12 @@ class _AdminDashboardState extends State<AdminDashboard> with SingleTickerProvid
                       ? Center(child: CircularProgressIndicator(color: isDark ? Colors.white : Colors.black))
                       : IndexedStack(
                           index: _selectedTabIndex,
-                          children: [_buildOverviewTab(isDark), _buildProductsTab(isDark), _buildOrdersTab(isDark)],
+                          children: [
+                            _buildOverviewTab(isDark),
+                            _buildProductsTab(isDark),
+                            _buildOrdersTab(isDark),
+                            _buildPromoCodesTab(isDark),
+                          ],
                         ),
                 ),
               ],
@@ -700,7 +1109,7 @@ class _AdminDashboardState extends State<AdminDashboard> with SingleTickerProvid
   Widget _buildSidebar() {
     return Container(
       width: 260,
-      color: Colors.black, // الشريط الجانبي دائماً أسود ليعطي شكل فخم
+      color: Colors.black,
       padding: const EdgeInsets.symmetric(vertical: 32, horizontal: 16),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
@@ -720,6 +1129,14 @@ class _AdminDashboardState extends State<AdminDashboard> with SingleTickerProvid
           _buildNavMenuItem(0, Icons.dashboard_outlined, 'Overview'),
           _buildNavMenuItem(1, Icons.inventory_2_outlined, 'Sneakers Inventory'),
           _buildNavMenuItem(2, Icons.local_shipping_outlined, 'Customer Orders', badge: _orders.where((o) => o['status'] == 'pending').length),
+          _buildNavMenuItem(3, Icons.discount_outlined, 'Promo Codes'),
+          
+          ListTile(
+            leading: const Icon(Icons.settings_outlined, color: Colors.white70, size: 22),
+            title: Text('Store Settings', style: GoogleFonts.montserrat(color: Colors.white70, fontSize: 13, fontWeight: FontWeight.w600)),
+            onTap: _openSettingsModal,
+          ),
+
           const Spacer(),
           const Divider(color: Colors.white12),
           ListTile(
@@ -766,6 +1183,11 @@ class _AdminDashboardState extends State<AdminDashboard> with SingleTickerProvid
   }
 
   Widget _buildTopHeader(bool isDark) {
+    String headerTitle = 'EXECUTIVE OVERVIEW';
+    if (_selectedTabIndex == 1) headerTitle = 'PRODUCTS INVENTORY';
+    if (_selectedTabIndex == 2) headerTitle = 'CUSTOMER ORDERS';
+    if (_selectedTabIndex == 3) headerTitle = 'DYNAMIC PROMO CODES';
+
     return Container(
       height: 70,
       padding: const EdgeInsets.symmetric(horizontal: 32),
@@ -773,17 +1195,23 @@ class _AdminDashboardState extends State<AdminDashboard> with SingleTickerProvid
       child: Row(
         mainAxisAlignment: MainAxisAlignment.spaceBetween,
         children: [
-          Text(
-            _selectedTabIndex == 0 ? 'EXECUTIVE OVERVIEW' : (_selectedTabIndex == 1 ? 'PRODUCTS INVENTORY' : 'CUSTOMER ORDERS'),
-            style: GoogleFonts.montserrat(fontWeight: FontWeight.w900, letterSpacing: 1, fontSize: 14, color: isDark ? Colors.white : Colors.black),
-          ),
+          Text(headerTitle, style: GoogleFonts.montserrat(fontWeight: FontWeight.w900, letterSpacing: 1, fontSize: 14, color: isDark ? Colors.white : Colors.black)),
           Row(
             children: [
               IconButton(icon: Icon(Icons.refresh, size: 22, color: isDark ? Colors.white : Colors.black), onPressed: _loadDashboardData),
               const SizedBox(width: 16),
-              CircleAvatar(radius: 16, backgroundColor: isDark ? Colors.white : Colors.black, child: Text('AD', style: TextStyle(color: isDark ? Colors.black : Colors.white, fontSize: 11, fontWeight: FontWeight.bold))),
-              const SizedBox(width: 12),
-              Text('System Admin', style: GoogleFonts.montserrat(fontWeight: FontWeight.bold, fontSize: 13, color: isDark ? Colors.white : Colors.black)),
+              InkWell(
+                onTap: _openSettingsModal,
+                child: Row(
+                  children: [
+                    CircleAvatar(radius: 16, backgroundColor: isDark ? Colors.white : Colors.black, child: Text('AD', style: TextStyle(color: isDark ? Colors.black : Colors.white, fontSize: 11, fontWeight: FontWeight.bold))),
+                    const SizedBox(width: 12),
+                    Text('System Admin', style: GoogleFonts.montserrat(fontWeight: FontWeight.bold, fontSize: 13, color: isDark ? Colors.white : Colors.black)),
+                    const SizedBox(width: 6),
+                    Icon(Icons.tune, size: 16, color: isDark ? Colors.white54 : Colors.black54),
+                  ],
+                ),
+              ),
             ],
           ),
         ],
@@ -845,7 +1273,11 @@ class _AdminDashboardState extends State<AdminDashboard> with SingleTickerProvid
   }
 
   Widget _buildProductsTab(bool isDark) {
-    final filtered = _products.where((p) => (p['name'] ?? '').toString().toLowerCase().contains(_searchQuery.toLowerCase())).toList();
+    final filtered = _products.where((p) {
+      final matchesQuery = (p['name'] ?? '').toString().toLowerCase().contains(_searchQuery.toLowerCase());
+      final matchesCategory = _categoryFilter == 'ALL' || (p['category'] ?? 'Men').toString().toUpperCase() == _categoryFilter;
+      return matchesQuery && matchesCategory;
+    }).toList();
 
     return Padding(
       padding: const EdgeInsets.all(40),
@@ -869,11 +1301,36 @@ class _AdminDashboardState extends State<AdminDashboard> with SingleTickerProvid
                   ),
                 ),
               ),
-              const SizedBox(width: 16),
+              const SizedBox(width: 12),
+              Wrap(
+                spacing: 6,
+                children: ['ALL', 'MEN', 'WOMEN'].map((cat) {
+                  final isSelected = _categoryFilter == cat;
+                  return InkWell(
+                    onTap: () => setState(() => _categoryFilter = cat),
+                    child: Container(
+                      padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
+                      decoration: BoxDecoration(
+                        color: isSelected ? (isDark ? Colors.white : Colors.black) : Colors.transparent,
+                        border: Border.all(color: isDark ? const Color(0xFF333333) : const Color(0xFFD1D5DB)),
+                      ),
+                      child: Text(
+                        cat,
+                        style: GoogleFonts.montserrat(
+                          fontSize: 11,
+                          fontWeight: FontWeight.bold,
+                          color: isSelected ? (isDark ? Colors.black : Colors.white) : (isDark ? Colors.white70 : Colors.black87),
+                        ),
+                      ),
+                    ),
+                  );
+                }).toList(),
+              ),
+              const SizedBox(width: 12),
               ElevatedButton.icon(
-                style: ElevatedButton.styleFrom(backgroundColor: isDark ? Colors.white : Colors.black, foregroundColor: isDark ? Colors.black : Colors.white, padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 20), shape: const RoundedRectangleBorder(borderRadius: BorderRadius.zero)),
+                style: ElevatedButton.styleFrom(backgroundColor: isDark ? Colors.white : Colors.black, foregroundColor: isDark ? Colors.black : Colors.white, padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 18), shape: const RoundedRectangleBorder(borderRadius: BorderRadius.zero)),
                 icon: const Icon(Icons.add, size: 18),
-                label: Text('ADD NEW SNEAKER', style: GoogleFonts.montserrat(fontWeight: FontWeight.bold, letterSpacing: 1, fontSize: 13)),
+                label: Text('ADD SNEAKER', style: GoogleFonts.montserrat(fontWeight: FontWeight.bold, letterSpacing: 1, fontSize: 12)),
                 onPressed: () => _openProductDialog(),
               ),
             ],
@@ -970,13 +1427,165 @@ class _AdminDashboardState extends State<AdminDashboard> with SingleTickerProvid
   }
 
   Widget _buildOrdersTab(bool isDark) {
+    final filteredOrders = _orders.where((o) {
+      final matchesStatus = _orderStatusFilter == 'ALL' || (o['status'] ?? '').toString().toLowerCase() == _orderStatusFilter.toLowerCase();
+      final query = _orderSearchQuery.toLowerCase().trim();
+      final matchesQuery = query.isEmpty ||
+          (o['customer_name'] ?? '').toString().toLowerCase().contains(query) ||
+          (o['customer_phone'] ?? '').toString().toLowerCase().contains(query) ||
+          (o['id'] ?? '').toString().toLowerCase().contains(query);
+      return matchesStatus && matchesQuery;
+    }).toList();
+
+    final statusFilters = ['ALL', 'PENDING', 'SHIPPED', 'DELIVERED'];
+
     return Padding(
       padding: const EdgeInsets.all(40),
-      child: Container(
-        decoration: BoxDecoration(color: isDark ? const Color(0xFF141414) : Colors.white, border: Border.all(color: isDark ? const Color(0xFF262626) : const Color(0xFFE2E8F0))),
-        child: _orders.isEmpty
-            ? Center(child: Text('No orders received.', style: GoogleFonts.montserrat(fontWeight: FontWeight.w500, color: isDark ? Colors.white54 : Colors.black)))
-            : _buildOrdersTable(_orders, isDark),
+      child: Column(
+        children: [
+          Row(
+            children: [
+              Expanded(
+                child: TextField(
+                  onChanged: (val) => setState(() => _orderSearchQuery = val),
+                  style: GoogleFonts.montserrat(fontSize: 13, fontWeight: FontWeight.w500, color: isDark ? Colors.white : Colors.black),
+                  decoration: InputDecoration(
+                    hintText: 'Search orders by client name, phone or ID...',
+                    hintStyle: GoogleFonts.montserrat(fontSize: 12, color: isDark ? Colors.white38 : Colors.black45),
+                    prefixIcon: Icon(Icons.search, size: 18, color: isDark ? Colors.white70 : Colors.black87),
+                    border: OutlineInputBorder(borderRadius: BorderRadius.zero, borderSide: BorderSide(color: isDark ? const Color(0xFF333333) : const Color(0xFFD1D5DB))),
+                    enabledBorder: OutlineInputBorder(borderRadius: BorderRadius.zero, borderSide: BorderSide(color: isDark ? const Color(0xFF333333) : const Color(0xFFD1D5DB))),
+                    fillColor: isDark ? const Color(0xFF141414) : Colors.white,
+                    filled: true,
+                    isDense: true,
+                  ),
+                ),
+              ),
+              const SizedBox(width: 16),
+              Wrap(
+                spacing: 8,
+                children: statusFilters.map((st) {
+                  final isSelected = _orderStatusFilter == st;
+                  return InkWell(
+                    onTap: () => setState(() => _orderStatusFilter = st),
+                    child: AnimatedContainer(
+                      duration: const Duration(milliseconds: 200),
+                      padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
+                      decoration: BoxDecoration(
+                        color: isSelected ? (isDark ? Colors.white : Colors.black) : (isDark ? const Color(0xFF141414) : const Color(0xFFF1F5F9)),
+                        border: Border.all(color: isSelected ? (isDark ? Colors.white : Colors.black) : (isDark ? const Color(0xFF333333) : const Color(0xFFE2E8F0))),
+                      ),
+                      child: Text(
+                        st,
+                        style: GoogleFonts.montserrat(
+                          fontSize: 11,
+                          fontWeight: FontWeight.bold,
+                          letterSpacing: 1,
+                          color: isSelected ? (isDark ? Colors.black : Colors.white) : (isDark ? Colors.white70 : Colors.black87),
+                        ),
+                      ),
+                    ),
+                  );
+                }).toList(),
+              ),
+              const SizedBox(width: 16),
+              ElevatedButton.icon(
+                style: ElevatedButton.styleFrom(
+                  backgroundColor: Colors.green[800],
+                  foregroundColor: Colors.white,
+                  elevation: 0,
+                  padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 18),
+                  shape: const RoundedRectangleBorder(borderRadius: BorderRadius.zero),
+                ),
+                icon: const Icon(Icons.file_download_outlined, size: 18),
+                label: Text('EXPORT CSV', style: GoogleFonts.montserrat(fontWeight: FontWeight.bold, fontSize: 11, letterSpacing: 1)),
+                onPressed: _exportOrdersToCsv,
+              ),
+            ],
+          ),
+          const SizedBox(height: 24),
+          Expanded(
+            child: Container(
+              decoration: BoxDecoration(color: isDark ? const Color(0xFF141414) : Colors.white, border: Border.all(color: isDark ? const Color(0xFF262626) : const Color(0xFFE2E8F0))),
+              child: filteredOrders.isEmpty
+                  ? Center(child: Text('No orders match current criteria.', style: GoogleFonts.montserrat(fontWeight: FontWeight.w500, color: isDark ? Colors.white54 : Colors.black54)))
+                  : _buildOrdersTable(filteredOrders, isDark),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildPromoCodesTab(bool isDark) {
+    return Padding(
+      padding: const EdgeInsets.all(40),
+      child: Column(
+        children: [
+          Row(
+            mainAxisAlignment: MainAxisAlignment.spaceBetween,
+            children: [
+              Text('ACTIVE DISCOUNT CODES', style: GoogleFonts.montserrat(fontWeight: FontWeight.w900, fontSize: 16, letterSpacing: 1, color: isDark ? Colors.white : Colors.black)),
+              ElevatedButton.icon(
+                style: ElevatedButton.styleFrom(
+                  backgroundColor: isDark ? Colors.white : Colors.black,
+                  foregroundColor: isDark ? Colors.black : Colors.white,
+                  padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 16),
+                  shape: const RoundedRectangleBorder(borderRadius: BorderRadius.zero),
+                ),
+                icon: const Icon(Icons.add, size: 16),
+                label: Text('CREATE PROMO CODE', style: GoogleFonts.montserrat(fontWeight: FontWeight.bold, fontSize: 12)),
+                onPressed: _openAddPromoModal,
+              ),
+            ],
+          ),
+          const SizedBox(height: 24),
+          Expanded(
+            child: Container(
+              decoration: BoxDecoration(color: isDark ? const Color(0xFF141414) : Colors.white, border: Border.all(color: isDark ? const Color(0xFF262626) : const Color(0xFFE2E8F0))),
+              child: _promoCodes.isEmpty
+                  ? Center(child: Text('No promo codes created yet.', style: GoogleFonts.montserrat(fontWeight: FontWeight.w500, color: isDark ? Colors.white54 : Colors.black54)))
+                  : ListView.separated(
+                      itemCount: _promoCodes.length,
+                      separatorBuilder: (_, __) => Divider(height: 1, color: isDark ? const Color(0xFF262626) : const Color(0xFFE5E7EB)),
+                      itemBuilder: (context, idx) {
+                        final code = _promoCodes[idx];
+                        final bool isActive = code['is_active'] ?? true;
+
+                        return ListTile(
+                          contentPadding: const EdgeInsets.symmetric(horizontal: 24, vertical: 12),
+                          leading: CircleAvatar(
+                            backgroundColor: isActive ? Colors.green.withOpacity(0.1) : Colors.red.withOpacity(0.1),
+                            child: Icon(Icons.discount, color: isActive ? Colors.green : Colors.red, size: 20),
+                          ),
+                          title: Text(code['code'] ?? '', style: GoogleFonts.montserrat(fontWeight: FontWeight.w900, fontSize: 15, letterSpacing: 1, color: isDark ? Colors.white : Colors.black)),
+                          subtitle: Text('Discount: ${code['discount_percentage']}%   |   Used: ${code['times_used'] ?? 0} / ${code['max_uses'] ?? 100}', style: GoogleFonts.montserrat(fontSize: 12, color: isDark ? Colors.white54 : Colors.black54)),
+                          trailing: Row(
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              Switch(
+                                value: isActive,
+                                activeColor: Colors.green,
+                                onChanged: (val) async {
+                                  await _supabase.from('promo_codes').update({'is_active': val}).match({'id': code['id']});
+                                  _fetchPromoCodes();
+                                },
+                              ),
+                              IconButton(
+                                icon: const Icon(Icons.delete_outline, size: 20, color: Colors.redAccent),
+                                onPressed: () async {
+                                  await _supabase.from('promo_codes').delete().match({'id': code['id']});
+                                  _fetchPromoCodes();
+                                },
+                              ),
+                            ],
+                          ),
+                        );
+                      },
+                    ),
+            ),
+          ),
+        ],
       ),
     );
   }
