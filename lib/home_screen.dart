@@ -3599,7 +3599,10 @@ ${discountAmount > 0 ? '\n*الخصم المطبق:* -${_formatPrice(discountAmo
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
               Row(
-                mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                mainAxisAlignment:
+                    Theme.of(context).platform == TargetPlatform.iOS
+                    ? MainAxisAlignment.spaceBetween
+                    : MainAxisAlignment.spaceBetween,
                 children: [
                   Text(
                     'EL DOC',
@@ -4403,7 +4406,45 @@ ${discountAmount > 0 ? '\n*الخصم المطبق:* -${_formatPrice(discountAmo
     );
   }
 
+  // الفوتر بعد إضافة Developed by Eng Mohamed Sallam ورابط LinkedIn
   Widget _buildFooter(BuildContext context, bool isDark, bool isMobile) {
+    const String linkedInUrl = 'https://www.linkedin.com/in/mohamedsallam4/';
+
+    Widget developerBadge = InkWell(
+      onTap: () => _openSocialUrl(linkedInUrl),
+      borderRadius: BorderRadius.circular(4),
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+        decoration: BoxDecoration(
+          color: isDark ? const Color(0xFF1E1E1E) : const Color(0xFFF1F5F9),
+          border: Border.all(
+            color: isDark ? const Color(0xFF333333) : const Color(0xFFE2E8F0),
+          ),
+          borderRadius: BorderRadius.circular(4),
+        ),
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            const Icon(
+              Ionicons.logoLinkedin,
+              size: 14,
+              color: Color(0xFF0A66C2),
+            ),
+            const SizedBox(width: 6),
+            Text(
+              'Developed by Eng Mohamed Sallam',
+              style: GoogleFonts.montserrat(
+                fontSize: 10.5,
+                fontWeight: FontWeight.w700,
+                color: isDark ? Colors.white70 : Colors.black87,
+                letterSpacing: 0.5,
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+
     return Container(
       color: isDark ? const Color(0xFF111111) : const Color(0xFFF9FAFB),
       width: double.infinity,
@@ -4619,36 +4660,76 @@ ${discountAmount > 0 ? '\n*الخصم المطبق:* -${_formatPrice(discountAmo
                   color: isDark ? const Color(0xFF262626) : Colors.black12,
                 ),
                 const SizedBox(height: 20),
-                Row(
-                  mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                  children: [
-                    Text(
-                      '© 2026 EL DOC. ALL RIGHTS RESERVED.',
-                      style: GoogleFonts.montserrat(
-                        fontSize: 10,
-                        color: isDark ? Colors.white54 : Colors.black38,
-                        fontWeight: FontWeight.w600,
+                if (isMobile) ...[
+                  Column(
+                    children: [
+                      developerBadge,
+                      const SizedBox(height: 14),
+                      Row(
+                        mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                        children: [
+                          Text(
+                            '© 2026 EL DOC. ALL RIGHTS RESERVED.',
+                            style: GoogleFonts.montserrat(
+                              fontSize: 9.5,
+                              color: isDark ? Colors.white54 : Colors.black38,
+                              fontWeight: FontWeight.w600,
+                            ),
+                          ),
+                          InkWell(
+                            onTap: () => Navigator.push(
+                              context,
+                              MaterialPageRoute(
+                                builder: (context) => const AdminDashboard(),
+                              ),
+                            ),
+                            child: Text(
+                              'Portal Login',
+                              style: GoogleFonts.montserrat(
+                                fontSize: 9.5,
+                                color: isDark ? Colors.white38 : Colors.black26,
+                                decoration: TextDecoration.underline,
+                                fontWeight: FontWeight.bold,
+                              ),
+                            ),
+                          ),
+                        ],
                       ),
-                    ),
-                    InkWell(
-                      onTap: () => Navigator.push(
-                        context,
-                        MaterialPageRoute(
-                          builder: (context) => const AdminDashboard(),
-                        ),
-                      ),
-                      child: Text(
-                        'Portal Login',
+                    ],
+                  ),
+                ] else ...[
+                  Row(
+                    mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                    children: [
+                      Text(
+                        '© 2026 EL DOC. ALL RIGHTS RESERVED.',
                         style: GoogleFonts.montserrat(
                           fontSize: 10,
-                          color: isDark ? Colors.white38 : Colors.black26,
-                          decoration: TextDecoration.underline,
-                          fontWeight: FontWeight.bold,
+                          color: isDark ? Colors.white54 : Colors.black38,
+                          fontWeight: FontWeight.w600,
                         ),
                       ),
-                    ),
-                  ],
-                ),
+                      developerBadge,
+                      InkWell(
+                        onTap: () => Navigator.push(
+                          context,
+                          MaterialPageRoute(
+                            builder: (context) => const AdminDashboard(),
+                          ),
+                        ),
+                        child: Text(
+                          'Portal Login',
+                          style: GoogleFonts.montserrat(
+                            fontSize: 10,
+                            color: isDark ? Colors.white38 : Colors.black26,
+                            decoration: TextDecoration.underline,
+                            fontWeight: FontWeight.bold,
+                          ),
+                        ),
+                      ),
+                    ],
+                  ),
+                ],
               ],
             ),
           ),
